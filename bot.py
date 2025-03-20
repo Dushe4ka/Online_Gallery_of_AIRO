@@ -1,254 +1,514 @@
-import asyncio
-from aiogram import Bot, Dispatcher, types
+import logging
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from config import BOT_TOKEN
-from database import init_db, add_user, get_content
-from admin import router as admin_router  # Импортируем только роутер, не бота
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton,
+    InputMediaPhoto, CallbackQuery
+)
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from config import BOT_TOKEN, ADMINS
+from database import (
+    init_db, add_user, get_content, get_users,
+    add_content, delete_content, delete_all_content,
+    add_moderator, remove_moderator, is_moderator, get_moderators
+)
+from service import backup_service
+import asyncio
 
-# Список ID администраторов (можно заменить на чтение из базы данных)
-from config import ADMINS as ADMIN_IDS
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
 
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Регистрация обработчиков
-def register_handlers():
-    # Регистрируем обработчики админского роутера
-    dp.include_router(admin_router)
+# Список разделов
+sections = {
+    "about_artist": "🖌 О художнике",
+    "about_style": "🎨 О направлении",
+    "catalog": "🖼 Каталог картин",
+    "events": "📅 Мероприятия",
+    "guests": "👥 Наши гости",
+    "cooperation": "🤝 Сотрудничество",
+    "contacts": "📞 Контакты"
+}
 
-    # Регистрация хендлеров для команды /start
-    @dp.message(Command("start"))
-    async def start_command(message: types.Message):
-        add_user(message.from_user.id)
 
-        # # Проверяем, является ли пользователь администратором
-        # if message.from_user.id in ADMIN_IDS:
-        #     # Клавиатура для администраторов
-        #     keyboard = types.ReplyKeyboardMarkup(
-        #         keyboard=[
-        #             [types.KeyboardButton(text="🖌 О художнике"), types.KeyboardButton(text="🎨 О направлении")],
-        #             [types.KeyboardButton(text="🖼 Каталог картин"), types.KeyboardButton(text="📅 Мероприятия")],
-        #             [types.KeyboardButton(text="👥 Наши гости"), types.KeyboardButton(text="🤝 Сотрудничество")],
-        #             [types.KeyboardButton(text="📞 Контакты")],
-        #             [types.KeyboardButton(text="⚙ Админ панель")]# Кнопка для админов
-        #         ], resize_keyboard=True
-        #     )
-        # else:
-        #     # Клавиатура для обычных пользователей
-        #     keyboard = types.ReplyKeyboardMarkup(
-        #         keyboard=[
-        #             [types.KeyboardButton(text="🖌 О художнике"), types.KeyboardButton(text="🎨 О направлении")],
-        #             [types.KeyboardButton(text="🖼 Каталог картин"), types.KeyboardButton(text="📅 Мероприятия")],
-        #             [types.KeyboardButton(text="👥 Наши гости"), types.KeyboardButton(text="🤝 Сотрудничество")],
-        #             [types.KeyboardButton(text="📞 Контакты")]
-        #         ], resize_keyboard=True
-        #     )
+### --- СОСТОЯНИЯ ДЛЯ АДМИН-ПАНЕЛИ --- ###
+class AddContentState(StatesGroup):
+    waiting_for_title = State()
+    waiting_for_description = State()
+    waiting_for_photos = State()
 
-        # Клавиатура для обычных пользователей
-        keyboard = types.ReplyKeyboardMarkup(
-            keyboard=[
-                [types.KeyboardButton(text="🖌 О художнике"), types.KeyboardButton(text="🎨 О направлении")],
-                [types.KeyboardButton(text="🖼 Каталог картин"), types.KeyboardButton(text="📅 Мероприятия")],
-                [types.KeyboardButton(text="👥 Наши гости"), types.KeyboardButton(text="🤝 Сотрудничество")],
-                [types.KeyboardButton(text="📞 Контакты")]
-            ], resize_keyboard=True
+
+class DeleteContentState(StatesGroup):
+    waiting_for_section = State()
+    waiting_for_content_id = State()
+
+
+class ClearSectionState(StatesGroup):
+    waiting_for_section = State()
+
+
+class AddModeratorState(StatesGroup):
+    waiting_for_user_id = State()
+
+
+class RemoveModeratorState(StatesGroup):
+    waiting_for_user_id = State()
+    confirmation = State()
+
+from aiogram.types import InputMediaVideo
+
+async def send_content(message: types.Message, section: str):
+    """Отправляет контент пользователю с группировкой медиа"""
+    content = await get_content(section)
+    if not content:
+        await message.answer(f"⚠ В разделе '{sections[section]}' пока нет контента.")
+        return
+
+    # Группируем по постам
+    posts = {}
+    for row in content:
+        post_id = row[0]
+        if post_id not in posts:
+            posts[post_id] = {
+                "title": row[1],
+                "description": row[2],
+                "photos": [],
+                "videos": []
+            }
+        if row[3] == "photo":
+            posts[post_id]["photos"].append(row[4])
+        elif row[3] == "video":
+            posts[post_id]["videos"].append(row[4])
+
+    # Отправляем посты
+    for post in posts.values():
+        text = f"📌 <b>{post['title']}</b>\n\n{post['description']}"
+
+        # Создаем медиагруппу
+        media_group = []
+
+        # Добавляем первое фото с текстом
+        if post["photos"]:
+            media_group.append(
+                InputMediaPhoto(
+                    media=post["photos"][0],
+                    caption=text,
+                    parse_mode="HTML"
+                )
+            )
+            # Добавляем остальные фото
+            for file_id in post["photos"][1:]:
+                media_group.append(InputMediaPhoto(media=file_id))
+
+        # Добавляем видео
+        for video_id in post["videos"]:
+            media_group.append(
+                InputMediaVideo(
+                    media=video_id
+                )
+            )
+
+        # Отправляем медиагруппу
+        if media_group:
+            await message.answer_media_group(media_group)
+        else:
+            # Если нет медиафайлов, отправляем только текст
+            await message.answer(text, parse_mode="HTML")
+
+
+### --- ОБРАБОТЧИКИ КНОПОК --- ###
+async def handle_section_button(message: types.Message):
+    """Обрабатывает нажатие на кнопку раздела"""
+    # Определяем, какой раздел был выбран
+    for section, button_text in sections.items():
+        if message.text == button_text:
+            await send_content(message, section)
+            break
+
+
+### --- ФУНКЦИИ АДМИН-ПАНЕЛИ --- ###
+async def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь админом"""
+    return user_id in ADMINS
+
+
+async def show_admin_panel(user_id: int):
+    """Отображает меню админа / модератора"""
+    if await is_admin(user_id):
+        text = "🔧 *Админ-панель* 🔧\nВыберите действие:"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить контент", callback_data="add_content")],
+            [InlineKeyboardButton(text="🗑 Удалить контент", callback_data="del_content")],
+            [InlineKeyboardButton(text="🔥 Очистить раздел", callback_data="clear_section")],
+            [InlineKeyboardButton(text="➕ Добавить модератора", callback_data="add_moderator")],
+            [InlineKeyboardButton(text="❌ Удалить модератора", callback_data="remove_moderator")]
+        ])
+    elif await is_moderator(user_id):
+        text = "🔹 *Модераторская панель* 🔹\nВыберите действие:"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить контент", callback_data="add_content")],
+            [InlineKeyboardButton(text="🗑 Удалить контент", callback_data="del_content")]
+        ])
+    else:
+        return "⛔ У вас нет доступа."
+
+    return text, keyboard
+
+
+@dp.message(Command("admin"))
+async def admin_command(message: types.Message):
+    """Обрабатывает команду /admin"""
+    user_id = message.from_user.id
+    response = await show_admin_panel(user_id)
+
+    if isinstance(response, tuple):
+        text, keyboard = response
+        await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await message.answer(response)
+
+
+### --- ОБРАБОТЧИКИ CALLBACK-КНОПОК --- ###
+async def get_sections_keyboard(action: str):
+    """Возвращает клавиатуру с разделами для выбранного действия"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=name, callback_data=f"{action}_{section}")]
+        for section, name in sections.items()
+    ])
+    return keyboard
+
+
+@dp.callback_query(F.data == "add_content")
+async def add_content_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработчик кнопки 'Добавить контент'"""
+    keyboard = await get_sections_keyboard("add_content")
+    await callback.message.answer("📝 Выберите раздел для добавления контента:", reply_markup=keyboard)
+    await state.set_state(AddContentState.waiting_for_title)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("add_content_"), AddContentState.waiting_for_title)
+async def add_content_section_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработчик выбора раздела для добавления контента"""
+    section = callback.data.split("_", 2)[-1]  # Берем последний элемент после второго разделителя
+    if section in sections:
+        await state.update_data(section=section)  # Сохраняем раздел в user_data
+        await callback.message.answer(f"📝 Вы выбрали раздел '{sections[section]}'. Теперь введите название поста:")
+        await state.set_state(AddContentState.waiting_for_title)
+    else:
+        await callback.message.answer("⚠ Раздел не найден.")
+    await callback.answer()
+
+
+@dp.message(AddContentState.waiting_for_title)
+async def process_title(message: types.Message, state: FSMContext):
+    """Обработчик ввода названия"""
+    title = message.text
+    await state.update_data(title=title)
+    await message.answer("📝 Теперь введите описание поста:")
+    await state.set_state(AddContentState.waiting_for_description)
+
+
+@dp.message(AddContentState.waiting_for_description)
+async def process_description(message: types.Message, state: FSMContext):
+    """Обработчик ввода описания"""
+    description = message.text
+    await state.update_data(description=description)
+    await message.answer("📷 Теперь отправьте фотографии (если их нет, отправьте '-'):")
+    await state.set_state(AddContentState.waiting_for_photos)
+
+
+@dp.message(AddContentState.waiting_for_photos)
+async def process_photos(message: types.Message, state: FSMContext):
+    """Обработчик ввода медиафайлов (фото или видео)"""
+    user_data = await state.get_data()
+
+    # Проверяем наличие ключа 'section'
+    if "section" not in user_data:
+        await message.answer("⚠ Ошибка: раздел не выбран. Начните заново.")
+        await state.clear()
+        return
+
+    if message.text == "-":
+        # Сохраняем без медиафайлов
+        await add_content(
+            user_data["section"],
+            user_data["title"],
+            user_data["description"],
+            []
         )
+        await message.answer("✅ Контент добавлен без медиафайлов")
+        await state.clear()
+        return
 
-        # Отправляем сообщение с соответствующей клавиатурой
-        await message.answer("🎨 Добро пожаловать в ONLINE GALLERY OF AIRO!", reply_markup=keyboard)
+    # Обработка фото
+    if message.photo:
+        new_media = {"type": "photo", "file_id": message.photo[-1].file_id}
+    # Обработка видео
+    elif message.video:
+        new_media = {"type": "video", "file_id": message.video.file_id}
+    else:
+        await message.answer("⚠ Отправьте фото, видео или '-' для завершения.")
+        return
 
-    from aiogram.types import FSInputFile
-    from aiogram.utils.media_group import MediaGroupBuilder
+    # Получаем текущий список медиафайлов
+    current_media = user_data.get("media", [])
 
-    # Хендлер для кнопки "🖌 О художнике"
-    @dp.message(lambda message: message.text == "🖌 О художнике")
-    async def about_artist(message: types.Message):
-        artist_info = """
-        🎨 **Художник Сергей AIRO** 🎨
+    # Проверяем дубликаты
+    if new_media not in current_media:
+        current_media.append(new_media)
+        await state.update_data(media=current_media)
 
-        Родился в 1960 году в Новороссийске. Детство и юность провел на Кубани, а сегодня Сергей живет и работает в Москве. 🌆  
-        Является постоянным членом **«Союза художников»**, **«Ассоциации новых художников»** и **«Общества изобразительного искусства»**.  
-        Награжден Зурабом Церетели почетным званием академика **«Международной Академии культуры и Искусства»**. 🏅
+    # Кнопка завершения
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Завершить", callback_data="finish_media")]
+    ])
 
-        Его картины были представлены на выставках в таких странах, как:
-        - 🇨🇭 Швейцария
-        - 🇦🇪 ОАЭ
-        - 🇦🇹 Австрия
-        - 🇩🇪 Германия
-        - 🇪🇸 Испания
-        - 🌍 Африка
-        - 🇷🇺 Россия
+    await message.answer(
+        f"📷 Медиафайл добавлен. Всего: {len(current_media)}\n"
+        "Можете отправить ещё или нажать кнопку ниже:",
+        reply_markup=keyboard
+    )
 
-        Член **Союза художников**. 🌟
 
-        📸 Прикрепленные изображения дают возможность более детально познакомиться с его работами.
-        """
+@dp.callback_query(F.data == "finish_media")
+async def finish_media(callback: CallbackQuery, state: FSMContext):
+    """Финализация добавления контента"""
+    user_data = await state.get_data()
 
-        # Создание MediaGroupBuilder для добавления медиа
-        media_group = MediaGroupBuilder(caption=artist_info)
+    await add_content(
+        user_data["section"],
+        user_data["title"],
+        user_data["description"],
+        user_data.get("media", [])
+    )
 
-        # Используем InputFile для добавления фото
-        photo1 = FSInputFile("media/1.jpg")  # Передаем путь к файлу
-        photo2 = FSInputFile("media/2.jpg")  # Передаем путь к файлу
+    await callback.message.answer("✅ Контент успешно сохранён!")
+    await state.clear()
+    await callback.answer()
 
-        # Добавляем фотографии в MediaGroupBuilder
-        media_group.add_photo(type="photo", media=photo1)
-        media_group.add_photo(type="photo", media=photo2)
 
-        # Отправляем медиа-группу
-        await message.answer_media_group(media=media_group.build())
+@dp.callback_query(F.data == "finish_photos")
+async def finish_photos(callback: CallbackQuery, state: FSMContext):
+    """Финализация добавления контента"""
+    user_data = await state.get_data()
 
-    @dp.message(lambda message: message.text == "🎨 О направлении")
-    async def about_style(message: types.Message):
-        # Длинный текст
-        style_info = """
-        🎨 **Художник и его стиль: "Ретрофутуризм" и "Русский космизм"**
+    await add_content(
+        user_data["section"],
+        user_data["title"],
+        user_data["description"],
+        user_data.get("photos", [])
+    )
 
-        Художник называет стиль, в котором работает, **«ретрофутуризмом»** или **«русским космизмом»**. Это популярное и растущее направление среди художников и коллекционеров по всему миру. 🌍
+    await callback.message.answer("✅ Контент успешно сохранён!")
+    await state.clear()
+    await callback.answer()
 
-        Он связывает **прошлое** с **будущим** в **настоящем времени**. Этот стиль — как мост между временами, отражающий глубину истории и её перспективы. 🕰️🚀
+@dp.callback_query(F.data == "del_content")
+async def delete_content_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработчик кнопки 'Удалить контент'"""
+    keyboard = await get_sections_keyboard("del_content")
+    await callback.message.answer("🗑 Выберите раздел для удаления контента:", reply_markup=keyboard)
+    await state.set_state(DeleteContentState.waiting_for_section)
+    await callback.answer()
 
-        🔹 **Техника исполнения**:
-        - Художник использует разнообразные техники, чтобы создать своё **уникальное выражение**.
-        - Внимание уделяется произведениям и образам **мифической жизни**, что придает работам мистическую атмосферу.
 
-        🔸 **Исследования и влияние**:
-        - В дальнейшем художник концентрируется на изучении **средневековых мастеров**.
-        - В основном исследует **религиозное направление** и влияние **фламандских средневековых художников**.
+@dp.callback_query(F.data.startswith("del_content_"), DeleteContentState.waiting_for_section)
+async def delete_content_section_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработчик выбора раздела для удаления контента"""
+    section = callback.data.split("_", 2)[-1]
+    await state.update_data(section=section)
 
-        ✨ **Сюрреалистичные полотна** отличаются **особой техникой исполнения**. AIRO искусственно состаривает свои работы, делая их **"мудрыми"**. 
-    
-        🌿 **Другие виды искусства**:
-        Помимо живописи, художник занимается **созданием инсталляций**, **предметов интерьера** и **цифровым искусством**.
-        """
+    # Получаем контент из раздела
+    content = await get_content(section)
+    if not content:
+        await callback.message.answer("⚠ В этом разделе пока нет контента.")
+        await state.clear()
+        return
 
-        await message.answer(style_info)
+    # Группируем по постам
+    posts = {}
+    for row in content:
+        post_id = row[0]
+        if post_id not in posts:
+            posts[post_id] = {
+                "title": row[1],
+                "description": row[2],
+                "media": []
+            }
+        if row[3] == "photo":
+            posts[post_id]["media"].append(row[4])
 
-        # # Создаем MediaGroup для фотографий
-        # media_group = MediaGroupBuilder()
-        # media_group.add_photo(type="photo", media=FSInputFile("media/3.jpg"))
-        # media_group.add_photo(type="photo", media=FSInputFile("media/4.jpg"))
-        # media_group.add_photo(type="photo", media=FSInputFile("media/5.jpg"))
-        #
-        # # Отправляем медиа-группу с фотографиями
-        # await message.answer_media_group(media=media_group.build())
+    # Создаем клавиатуру с постами
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{post['title']}", callback_data=f"delete_post_{post_id}")]
+        for post_id, post in posts.items()
+    ])
+    await callback.message.answer("🗑 Выберите пост для удаления:", reply_markup=keyboard)
+    await state.set_state(DeleteContentState.waiting_for_content_id)
+    await callback.answer()
 
-    # Хендлер для кнопки "🖼 Каталог картин"
-    @dp.message(lambda message: message.text == "🖼 Каталог картин")
-    async def show_catalog(message: types.Message):
-        section = "catalog"
-        content = get_content(section)
 
-        for id, media_type, media_url, description in content:
-            if media_type == "photo":
-                await message.answer_photo(media_url, caption=description)
-            else:
-                await message.answer_video(media_url, caption=description)
+@dp.callback_query(F.data.startswith("delete_post_"), DeleteContentState.waiting_for_content_id)
+async def process_delete_post(callback: CallbackQuery, state: FSMContext):
+    """Обработчик выбора поста для удаления"""
+    content_id = callback.data.split("_")[-1]
+    user_data = await state.get_data()
+    section = user_data["section"]
 
-    # Хендлер для кнопки "📅 Мероприятия"
-    @dp.message(lambda message: message.text == "📅 Мероприятия")
-    async def show_events(message: types.Message):
-        section = "events"
-        content = get_content(section)
+    await delete_content(section, int(content_id))
+    await callback.message.answer(f"✅ Пост с ID {content_id} успешно удалён из раздела '{sections[section]}'.")
+    await state.clear()
+    await callback.answer()
 
-        for id, media_type, media_url, description in content:
-            if media_type == "photo":
-                await message.answer_photo(media_url, caption=description)
-            else:
-                await message.answer_video(media_url, caption=description)
 
-    # Хендлер для кнопки "👥 Наши гости"
-    @dp.message(lambda message: message.text == "👥 Наши гости")
-    async def show_guests(message: types.Message):
-        section = "guests"
-        content = get_content(section)
+@dp.callback_query(F.data == "clear_section")
+async def clear_section_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработчик кнопки 'Очистить раздел'"""
+    keyboard = await get_sections_keyboard("clear_section")
+    await callback.message.answer("⚠ Выберите раздел для очистки:", reply_markup=keyboard)
+    await state.set_state(ClearSectionState.waiting_for_section)
+    await callback.answer()
 
-        for id, media_type, media_url, description in content:
-            if media_type == "photo":
-                await message.answer_photo(media_url, caption=description)
-            else:
-                await message.answer_video(media_url, caption=description)
 
-    # Хендлер для кнопки "🤝 Сотрудничество"
-    @dp.message(lambda message: message.text == "🤝 Сотрудничество")
-    async def cooperation_info(message: types.Message):
-        cooperation_info = """
-        ✨ **Рестораны и заведения:**
+@dp.callback_query(F.data.startswith("clear_section_"), ClearSectionState.waiting_for_section)
+async def clear_section_section_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработчик выбора раздела для очистки"""
+    section = callback.data.split("_", 2)[-1]
+    await delete_all_content(section)
+    await callback.message.answer(f"✅ Раздел '{sections[section]}' успешно очищен.")
+    await state.clear()
+    await callback.answer()
 
-        - 🍽 **Ресторан «BLANC»** — изысканная атмосфера для ценителей высокой кухни.
-        - 🍴 **Ресторан «RAZGAR»** — место, где восточная кухня встречается с современными тенденциями.
-        - 🏙 **Клубное пространство «Смоленка7»** — стильный уголок для развлечений и встреч.
 
-        🌊 **Эксклюзивные услуги:**
+@dp.callback_query(F.data == "add_moderator")
+async def add_moderator_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработчик кнопки 'Добавить модератора'"""
+    await callback.message.answer("👤 Введите ID пользователя, которого хотите сделать модератором:")
+    await state.set_state(AddModeratorState.waiting_for_user_id)
+    await callback.answer()
 
-        - 🐟 **Премиальная океаническая доставка «BLUEFIN»** — свежие морепродукты, доставленные прямо к вашему столу.
-        - 🦑 **Магазин черной икры и астраханской рыбы «ASTRAKHAN FISH»** — лучшие деликатесы для гурманов.
 
-        🍵 **Чай и здоровье:**
+@dp.message(AddModeratorState.waiting_for_user_id)
+async def process_add_moderator(message: types.Message, state: FSMContext):
+    """Обработчик ввода ID пользователя для добавления модератора"""
+    user_id = message.text
+    if not user_id.isdigit():
+        await message.answer("⚠ ID пользователя должен быть числом. Попробуйте снова.")
+        return
 
-        - 🍃 **Чайный дом «VAN TEA»** — атмосфера уюта и восхитительных вкусов чая.
+    await add_moderator(int(user_id))
+    await message.answer(f"✅ Пользователь с ID {user_id} успешно добавлен в модераторы.")
+    await state.clear()
 
-        📺 **Медиа и пресс:**
 
-        - 📡 **Телеканал «LISCHANNEL»** — всегда актуальные новости и интересные программы.
-        - 📖 **Журнал «BABYER MAGAZINE»** — уникальные статьи и советы для современных родителей.
+@dp.callback_query(F.data == "remove_moderator")
+async def remove_moderator_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработчик кнопки 'Удалить модератора'"""
+    moderators = await get_moderators()
+    if not moderators:
+        await callback.message.answer("⚠ Модераторов пока нет.")
+        return
 
-        🍩 **Здоровое питание и клиники:**
+    # Создаем клавиатуру с модераторами
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Модератор {moderator}", callback_data=f"remove_moderator_{moderator}")]
+        for moderator in moderators
+    ])
+    await callback.message.answer("🚫 Выберите модератора для удаления:", reply_markup=keyboard)
+    await callback.answer()
 
-        - 🍓 **Бренд ПП десертов «CRYSTAL MOCHI»** — полезные и вкусные десерты для всех.
-        - 🏥 **Сеть клиник «МЕДЦЕНТРСЕРВИС»** — забота о вашем здоровье и комфорте.
 
-        🛡 **Социальные инициативы:**
+# class RemoveModeratorState(StatesGroup):
+#     confirmation = State()
 
-        - 🌟 **АНО «ОБЕРЕГ»** — поддержка и защита тех, кто нуждается в помощи.
-        """
-        await message.answer(cooperation_info)
 
-    # Хендлер для кнопки "📞 Контакты"
-    @dp.message(lambda message: message.text == "📞 Контакты")
-    async def contact_info(message: types.Message):
-        contact_info = """
-        Наши контактные данные:
+@dp.callback_query(F.data.startswith("remove_moderator_"))
+async def confirm_remove_moderator(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение удаления модератора"""
+    user_id = int(callback.data.split("_")[-1])
+    await state.update_data(user_id=user_id)
 
-        🖋 **Арт-директор:**
-        - 👤 **АЛЁХИН НИКОЛАЙ ОЛЕГОВИЧ**
-        - 📞 **Телефон:** +7 926 211-11-70
-        """
-        await message.answer(contact_info)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да", callback_data="confirm_remove"),
+            InlineKeyboardButton(text="❌ Нет", callback_data="cancel_remove")
+        ]
+    ])
 
-    # Хендлер для кнопки "⚙ Админ панель" (если это администратор)
-    # @dp.message(lambda message: message.text == "⚙ Админ панель")
-    # async def admin_panel(message: types.Message):
-    #     if message.from_user.id in ADMIN_IDS:
-    #         # Приветственное сообщение в админ панель
-    #         await message.answer(
-    #             "Добро пожаловать в админ панель! Вы можете добавить новый контент или управлять пользователями.")
-    #
-    #         # Здесь можно дополнительно добавить меню для админов
-    #         keyboard = types.ReplyKeyboardMarkup(
-    #             keyboard=[
-    #                 [types.KeyboardButton(text="➕ Добавить фото"), types.KeyboardButton(text="➕ Добавить видео")]
-    #             ],
-    #             resize_keyboard=True
-    #         )
-    #
-    #         # Отправка клавиатуры с опциями для администраторов
-    #         await message.answer("Выберите, что хотите добавить:", reply_markup=keyboard)
-    #     else:
-    #         await message.answer("У вас нет доступа к админ панели.")
+    await callback.message.answer(
+        f"⚠ Вы уверены, что хотите удалить модератора {user_id}?",
+        reply_markup=keyboard
+    )
+    await state.set_state(RemoveModeratorState.confirmation)
+    await callback.answer()
 
-# Основная асинхронная функция для запуска бота
+
+@dp.callback_query(F.data == "confirm_remove", RemoveModeratorState.confirmation)
+async def process_remove(callback: CallbackQuery, state: FSMContext):
+    """Обработка подтверждения"""
+    data = await state.get_data()
+    await remove_moderator(data["user_id"])
+    await callback.message.answer("✅ Модератор успешно удалён!")
+    await state.clear()
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "cancel_remove", RemoveModeratorState.confirmation)
+async def cancel_remove(callback: CallbackQuery, state: FSMContext):
+    """Отмена удаления"""
+    await state.clear()
+    await callback.message.answer("❌ Удаление отменено")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("remove_moderator_"))
+async def process_remove_moderator(callback: CallbackQuery):
+    """Обработчик выбора модератора для удаления"""
+    user_id = callback.data.split("_")[-1]
+    await remove_moderator(int(user_id))
+    await callback.message.answer(f"✅ Модератор с ID {user_id} успешно удалён.")
+    await callback.answer()
+
+
+### --- РЕГИСТРАЦИЯ ХЭНДЛЕРОВ --- ###
+def register_handlers():
+    """Регистрируем обработчики"""
+    dp.message.register(start_command, Command("start"))
+
+    # Обработчики для кнопок разделов
+    for text in sections.values():
+        dp.message.register(handle_section_button, F.text == text)
+
+
+### --- ГЛАВНЫЙ ЦИКЛ БОТА --- ###
+async def start_command(message: types.Message):
+    """Команда /start"""
+    await add_user(message.from_user.id)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🖌 О художнике"), KeyboardButton(text="🎨 О направлении")],
+            [KeyboardButton(text="🖼 Каталог картин"), KeyboardButton(text="📅 Мероприятия")],
+            [KeyboardButton(text="👥 Наши гости"), KeyboardButton(text="🤝 Сотрудничество")],
+            [KeyboardButton(text="📞 Контакты")]
+        ], resize_keyboard=True
+    )
+    await message.answer("🎨 Добро пожаловать в ONLINE GALLERY OF AIRO!", reply_markup=keyboard)
+
+
 async def main():
-    # Инициализация базы данных
-    init_db()
-
-    # Регистрация обработчиков
+    await init_db()
     register_handlers()
 
-    # Запуск бота
+    # Запускаем фоновый процесс для бэкапа
+    asyncio.create_task(backup_service())
+
     await dp.start_polling(bot)
 
-# Запуск приложения
+
 if __name__ == "__main__":
     asyncio.run(main())
