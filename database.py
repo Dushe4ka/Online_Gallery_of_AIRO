@@ -55,16 +55,11 @@ async def init_db():
 async def add_content(section: str, title: str, description: str, media_files: list[dict]):
     """
     Добавляет контент с медиафайлами в указанный раздел.
-
-    :param section: Название раздела (например, "about_artist")
-    :param title: Заголовок контента
-    :param description: Описание контента
-    :param media_files: Список словарей с информацией о медиафайлах (фото или видео)
-                       Пример: [{"type": "photo", "file_id": "123"}, {"type": "video", "file_id": "456"}]
+    Возвращает ID добавленного контента.
     """
     async with aiosqlite.connect(DATABASE) as db:
         try:
-            # 1. Добавляем основной контент
+            # 1. Добавляем основной контент (текст)
             cursor = await db.execute(
                 f"""
                 INSERT INTO {section} (title, description)
@@ -85,6 +80,9 @@ async def add_content(section: str, title: str, description: str, media_files: l
                         seen.add(file_key)
                         unique_files.append(file)
 
+                # Логируем file_id
+                logging.info(f"Добавляемые медиафайлы: {unique_files}")
+
                 # Подготавливаем данные для вставки
                 media_data = [
                     (content_id, file["type"], file["file_id"])
@@ -100,26 +98,46 @@ async def add_content(section: str, title: str, description: str, media_files: l
                     media_data
                 )
 
+            # Явно завершаем транзакцию
             await db.commit()
-            return True
+            return content_id  # Возвращаем ID добавленного контента
 
         except Exception as e:
             logging.error(f"Ошибка добавления контента: {e}")
             await db.rollback()
-            return False
+            return None
 
 
 # Получение контента
-async def get_content(section):
-    """Получает контент с медиафайлами"""
+async def get_content(section: str, content_id: int = None):
+    """
+    Получает контент с медиафайлами.
+
+    :param section: Раздел, из которого нужно получить контент.
+    :param content_id: ID конкретного контента (опционально).
+    :return: Список контента.
+    """
     async with aiosqlite.connect(DATABASE) as db:
-        cursor = await db.execute(f"""
-            SELECT c.id, c.title, c.description, m.media_type, m.file_id
-            FROM {section} c
-            LEFT JOIN {section}_media m ON c.id = m.content_id
-            ORDER BY c.published_at DESC
-        """)
-        return await cursor.fetchall()
+        if content_id:
+            # Получаем конкретный контент по ID
+            cursor = await db.execute(f"""
+                SELECT c.id, c.title, c.description, m.media_type, m.file_id
+                FROM {section} c
+                LEFT JOIN {section}_media m ON c.id = m.content_id
+                WHERE c.id = ?
+                ORDER BY c.published_at DESC
+            """, (content_id,))
+        else:
+            # Получаем весь контент раздела
+            cursor = await db.execute(f"""
+                SELECT c.id, c.title, c.description, m.media_type, m.file_id
+                FROM {section} c
+                LEFT JOIN {section}_media m ON c.id = m.content_id
+                ORDER BY c.published_at DESC
+            """)
+        content = await cursor.fetchall()
+        logging.info(f"Извлеченный контент: {content}")
+        return content
 
 
 async def get_moderators():
@@ -184,3 +202,4 @@ async def is_moderator(user_id):
     async with aiosqlite.connect(DATABASE) as db:
         cursor = await db.execute("SELECT 1 FROM moderators WHERE user_id = ?", (user_id,))
         return await cursor.fetchone() is not None
+

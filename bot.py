@@ -1,4 +1,6 @@
 import logging
+
+import aiosqlite
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -9,12 +11,15 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from config import BOT_TOKEN, ADMINS
 from database import (
-    init_db, add_user, get_content, get_users,
+    init_db, get_content,
     add_content, delete_content, delete_all_content,
-    add_moderator, remove_moderator, is_moderator, get_moderators
+    add_moderator, remove_moderator, is_moderator, get_moderators, DATABASE
 )
+from database_users import add_user, get_all_users, init_users_db
 from service import backup_service
 import asyncio
+# Добавляем импорт новой базы данных
+from utils import send_new_post
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +31,7 @@ dp = Dispatcher()
 # Список разделов
 sections = {
     "about_artist": "🖌 О художнике",
-    "about_style": "🎨 О направлении",
+    "about_style": "🎨 Life",
     "catalog": "🖼 Каталог картин",
     "events": "📅 Мероприятия",
     "guests": "👥 Наши гости",
@@ -59,7 +64,9 @@ class RemoveModeratorState(StatesGroup):
     waiting_for_user_id = State()
     confirmation = State()
 
+
 from aiogram.types import InputMediaVideo
+
 
 async def send_content(message: types.Message, section: str):
     """Отправляет контент пользователю с группировкой медиа"""
@@ -233,15 +240,18 @@ async def process_photos(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
+    # Если пользователь отправляет "-", сохраняем пост без медиафайлов
     if message.text == "-":
-        # Сохраняем без медиафайлов
-        await add_content(
+        content_id = await add_content(
             user_data["section"],
             user_data["title"],
             user_data["description"],
             []
         )
-        await message.answer("✅ Контент добавлен без медиафайлов")
+        if content_id:
+            await message.answer("✅ Контент добавлен без медиафайлов")
+        else:
+            await message.answer("⚠ Ошибка при сохранении контента.")
         await state.clear()
         return
 
@@ -262,6 +272,9 @@ async def process_photos(message: types.Message, state: FSMContext):
     if new_media not in current_media:
         current_media.append(new_media)
         await state.update_data(media=current_media)
+        logging.info(f"Добавлен новый медиафайл: {new_media}")
+    else:
+        logging.info(f"Медиафайл уже добавлен: {new_media}")
 
     # Кнопка завершения
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -280,14 +293,31 @@ async def finish_media(callback: CallbackQuery, state: FSMContext):
     """Финализация добавления контента"""
     user_data = await state.get_data()
 
-    await add_content(
+    # Проверяем наличие ключа 'section'
+    if "section" not in user_data:
+        await callback.message.answer("⚠ Ошибка: раздел не выбран. Начните заново.")
+        await state.clear()
+        return
+
+    # Добавляем контент в базу данных
+    content_id = await add_content(
         user_data["section"],
         user_data["title"],
         user_data["description"],
         user_data.get("media", [])
     )
 
-    await callback.message.answer("✅ Контент успешно сохранён!")
+    if content_id:
+        # Получаем всех пользователей для рассылки
+        users = await get_all_users()
+
+        # Рассылаем новый контент всем пользователям
+        await send_new_post(bot, user_data["section"], content_id, users)
+
+        await callback.message.answer("✅ Контент успешно сохранён и отправлен!")
+    else:
+        await callback.message.answer("⚠ Ошибка при сохранении контента.")
+
     await state.clear()
     await callback.answer()
 
@@ -488,10 +518,13 @@ def register_handlers():
 ### --- ГЛАВНЫЙ ЦИКЛ БОТА --- ###
 async def start_command(message: types.Message):
     """Команда /start"""
+
+    # Добавляем пользователя в новую базу данных
     await add_user(message.from_user.id)
+
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🖌 О художнике"), KeyboardButton(text="🎨 О направлении")],
+            [KeyboardButton(text="🖌 О художнике"), KeyboardButton(text="🎨 Life")],
             [KeyboardButton(text="🖼 Каталог картин"), KeyboardButton(text="📅 Мероприятия")],
             [KeyboardButton(text="👥 Наши гости"), KeyboardButton(text="🤝 Сотрудничество")],
             [KeyboardButton(text="📞 Контакты")]
@@ -500,8 +533,14 @@ async def start_command(message: types.Message):
     await message.answer("🎨 Добро пожаловать в ONLINE GALLERY OF AIRO!", reply_markup=keyboard)
 
 
+
+
+
 async def main():
     await init_db()
+    # Инициализация новой базы данных для пользователей
+    await init_users_db()
+
     register_handlers()
 
     # Запускаем фоновый процесс для бэкапа
