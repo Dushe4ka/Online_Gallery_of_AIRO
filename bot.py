@@ -30,8 +30,8 @@ dp = Dispatcher()
 
 # Список разделов
 sections = {
-    "about_artist": "🖌 О художнике",
-    "about_style": "🎨 Life",
+    "about_artist": "🎨 О художнике",
+    "about_style": "🤍 Life",
     "catalog": "🖼 Каталог картин",
     "events": "📅 Мероприятия",
     "guests": "👥 Наши гости",
@@ -75,9 +75,9 @@ async def send_content(message: types.Message, section: str):
         await message.answer(f"⚠ В разделе '{sections[section]}' пока нет контента.")
         return
 
-    # Группируем по постам
+    # Группируем по постам и сортируем по ID (от меньшего к большему)
     posts = {}
-    for row in content:
+    for row in sorted(content, key=lambda x: x[0]):  # Сортировка по post_id
         post_id = row[0]
         if post_id not in posts:
             posts[post_id] = {
@@ -91,8 +91,12 @@ async def send_content(message: types.Message, section: str):
         elif row[3] == "video":
             posts[post_id]["videos"].append(row[4])
 
-    # Отправляем посты
-    for post in posts.values():
+    # Сохраняем ID первого сообщения
+    first_message_id = None
+    sent_messages = []
+
+    # Отправляем посты от первого к последнему
+    for post_id, post in sorted(posts.items()):
         text = f"📌 <b>{post['title']}</b>\n\n{post['description']}"
 
         # Создаем медиагруппу
@@ -121,11 +125,31 @@ async def send_content(message: types.Message, section: str):
 
         # Отправляем медиагруппу
         if media_group:
-            await message.answer_media_group(media_group)
+            messages = await message.answer_media_group(media_group)
+            if first_message_id is None:
+                first_message_id = messages[0].message_id
+            sent_messages.extend(messages)
         else:
             # Если нет медиафайлов, отправляем только текст
-            await message.answer(text, parse_mode="HTML")
+            msg = await message.answer(text, parse_mode="HTML")
+            if first_message_id is None:
+                first_message_id = msg.message_id
+            sent_messages.append(msg)
 
+        # Небольшая задержка между постами
+        await asyncio.sleep(0.5)
+
+    # После отправки всех постов, переводим фокус на первый пост
+    if first_message_id:
+        try:
+            # Отправляем служебное сообщение с привязкой к первому посту
+            await message.answer(
+                "⬆️ Нажмите чтобы смотреть сначала",
+                reply_to_message_id=first_message_id,
+                disable_notification=True
+            )
+        except Exception as e:
+            logging.error(f"Error while focusing on first message: {e}")
 
 ### --- ОБРАБОТЧИКИ КНОПОК --- ###
 async def handle_section_button(message: types.Message):
@@ -524,7 +548,7 @@ async def start_command(message: types.Message):
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🖌 О художнике"), KeyboardButton(text="🎨 Life")],
+            [KeyboardButton(text="🎨 О художнике"), KeyboardButton(text="🤍 Life")],
             [KeyboardButton(text="🖼 Каталог картин"), KeyboardButton(text="📅 Мероприятия")],
             [KeyboardButton(text="👥 Наши гости"), KeyboardButton(text="🤝 Сотрудничество")],
             [KeyboardButton(text="📞 Контакты")]
