@@ -144,7 +144,7 @@ async def send_content(message: types.Message, section: str):
         try:
             # Отправляем служебное сообщение с привязкой к первому посту
             await message.answer(
-                "⬆️ Нажмите чтобы смотреть сначала",
+                "⬆️ПЕРЕЙТИ В НАЧАЛО⬆️",
                 reply_to_message_id=first_message_id,
                 disable_notification=True
             )
