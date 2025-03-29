@@ -1,6 +1,7 @@
-# utils.py
 import logging
+import asyncio
 from aiogram.types import InputMediaPhoto, InputMediaVideo
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter, TelegramAPIError, TelegramForbiddenError
 
 
 async def send_new_post(bot, section: str, content_id: int, users: list[int]):
@@ -60,19 +61,24 @@ async def send_new_post(bot, section: str, content_id: int, users: list[int]):
 
             # Добавляем видео
             for video_id in post["videos"]:
-                media_group.append(
-                    InputMediaVideo(
-                        media=video_id
-                    )
-                )
+                media_group.append(InputMediaVideo(media=video_id))
 
-            # Отправляем медиагруппу
-            if media_group:
-                await bot.send_media_group(chat_id=user_id, media=media_group)
-            else:
-                # Если нет медиафайлов, отправляем только текст
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=text,
-                    parse_mode="HTML"
-                )
+            try:
+                # Отправляем медиагруппу
+                if media_group:
+                    await bot.send_media_group(chat_id=user_id, media=media_group)
+                else:
+                    # Если нет медиафайлов, отправляем только текст
+                    await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+
+            except TelegramForbiddenError:
+                logging.warning(f"Пользователь {user_id} заблокировал бота или удалил чат. Пропускаем.")
+                continue  # Переход к следующему пользователю
+
+            except TelegramRetryAfter as e:
+                logging.warning(f"Превышен лимит запросов! Ожидание {e.retry_after} секунд...")
+                await asyncio.sleep(e.retry_after)  # Ждём указанное время и повторяем
+
+            except (TelegramBadRequest, TelegramAPIError) as e:
+                logging.error(f"Ошибка при отправке сообщения пользователю {user_id}: {e}")
+                continue  # Пропускаем пользователя и идём дальше

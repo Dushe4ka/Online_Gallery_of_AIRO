@@ -557,9 +557,6 @@ async def start_command(message: types.Message):
     await message.answer("🎨 Добро пожаловать в ONLINE GALLERY OF AIRO!", reply_markup=keyboard)
 
 
-
-
-
 async def main():
     await init_db()
     # Инициализация новой базы данных для пользователей
