@@ -1,51 +1,65 @@
 # database_users.py
 import logging
 import aiosqlite
+from config import USERS_DB_PATH # Используем путь из конфига
 
 # Название новой базы данных
-DATABASE_USERS = "users_data.db"
+DATABASE = USERS_DB_PATH
 
 
 async def init_users_db():
     """
-    Создаёт таблицу users, если её ещё нет.
+    Создаёт таблицу users в отдельной базе, если её ещё нет.
     """
-    async with aiosqlite.connect(DATABASE_USERS) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY
-            )
-        """)
-        await db.commit()
-        logging.info("Таблица users создана или уже существует.")
+    try:
+        async with aiosqlite.connect(DATABASE) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY
+                )
+            """)
+            await db.commit()
+        logging.info(f"Users table in '{DATABASE}' created or already exists.")
+    except Exception as e:
+         logging.error(f"Error initializing users database '{DATABASE}': {e}")
 
 
 async def add_user(user_id: int):
     """
-    Добавляет пользователя в таблицу users.
+    Добавляет пользователя в таблицу users (в отдельной базе).
     Если user_id уже существует, запись не добавляется.
     """
-    async with aiosqlite.connect(DATABASE_USERS) as db:
-        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-        await db.commit()
-        logging.info(f"Пользователь {user_id} добавлен в таблицу users (если его ещё не было).")
+    try:
+        async with aiosqlite.connect(DATABASE) as db:
+            await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+            await db.commit()
+        # logging.info(f"User {user_id} added to '{DATABASE}' (if not already present).") # Можно раскомментировать для отладки
+    except Exception as e:
+         logging.error(f"Error adding user {user_id} to '{DATABASE}': {e}")
 
 
 async def remove_user(user_id: int):
     """
-    Удаляет пользователя из таблицы users.
+    Удаляет пользователя из таблицы users (в отдельной базе).
     """
-    async with aiosqlite.connect(DATABASE_USERS) as db:
-        await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-        await db.commit()
-        logging.info(f"Пользователь {user_id} удалён из таблицы users.")
+    try:
+        async with aiosqlite.connect(DATABASE) as db:
+            await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+            await db.commit()
+        logging.info(f"User {user_id} removed from '{DATABASE}'.")
+    except Exception as e:
+         logging.error(f"Error removing user {user_id} from '{DATABASE}': {e}")
 
 
-async def get_all_users():
+async def get_all_users() -> list[int]:
     """
-    Получает всех пользователей из таблицы users.
+    Получает всех пользователей из таблицы users (из отдельной базы).
     """
-    async with aiosqlite.connect(DATABASE_USERS) as db:
-        cursor = await db.execute("SELECT user_id FROM users")
-        users = await cursor.fetchall()
-        return [user[0] for user in users]
+    try:
+        async with aiosqlite.connect(DATABASE) as db:
+            async with db.execute("SELECT user_id FROM users") as cursor:
+                users = await cursor.fetchall()
+                return [user[0] for user in users]
+    except Exception as e:
+        logging.error(f"Error getting all users from '{DATABASE}': {e}")
+        return []
