@@ -106,7 +106,7 @@ async def send_post_item(message: types.Message, section: str, post_details: dic
         text_to_send = title_formatted
         caption_for_group_first = title_formatted
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="ℹ️ Описание", callback_data=f"show_desc_{section}_{post_id}")]
+            [InlineKeyboardButton(text="ℹ️ ОПИСАНИЕ", callback_data=f"show_desc_{section}_{post_id}")]
         ])
         button_message_text = "Меню поста:"
     else:
