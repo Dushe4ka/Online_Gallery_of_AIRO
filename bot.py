@@ -309,7 +309,7 @@ async def hide_description_handler(callback: CallbackQuery):
 
     # Формируем кнопку "Описание"
     new_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="ℹ️ Описание", callback_data=f"show_desc_{section}_{post_id}")]
+        [InlineKeyboardButton(text="ℹ️ ОПИСАНИЕ", callback_data=f"show_desc_{section}_{post_id}")]
     ])
     # Формируем текст для начального состояния (без HTML)
     short_text = f"📌 {title}"
