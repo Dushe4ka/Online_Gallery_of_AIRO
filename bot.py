@@ -470,7 +470,7 @@ async def admin_delete_content_section_selected(callback: CallbackQuery, state: 
     # Используем сортировку из get_content (ASC)
     for post_id in posts.keys(): title = posts[post_id]; button_text = f"{post_id}: {title[:40]}{'...' if len(title) > 40 else ''}"; buttons.append([InlineKeyboardButton(text=button_text, callback_data=f"admin:del_post:{post_id}")])
     if not buttons: await callback.message.edit_text("⚠️ Не удалось список."); await state.clear(); return
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:del_content")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:back_to_panel")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text(f"🗑 Выберите пост для удаления из '{sections[section]}':", reply_markup=keyboard)
     await state.set_state(AdminStates.delete_content_choose_post); await callback.answer()
