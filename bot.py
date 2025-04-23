@@ -596,39 +596,82 @@ async def admin_remove_moderator_confirmed(callback: CallbackQuery, state: FSMCo
          if panel_kb: await callback.message.answer(final_text, reply_markup=panel_kb)
          else: await callback.message.answer(final_text)
 
+
 # --- Перехватчики непредвиденного ввода в состояниях ---
-# <<< ВСТАВИТЬ ФРАГМЕНТ 1 ЗДЕСЬ >>>
-# Хендлер для любых сообщений в любом состоянии, если они не были обработаны ранее
-@dp.message(StateFilter('*')) # StateFilter('*') ловит любое состояние
+# ЭТИ ОБРАБОТЧИКИ ДОЛЖНЫ БЫТЬ ОПРЕДЕЛЕНЫ В КОДЕ ДО ВЫЗОВА register_section_handlers()
+
+# Хендлер для любых сообщений в любом состоянии FSM
+@dp.message(StateFilter(AdminStates)) # ЛОВИМ ТОЛЬКО СОСТОЯНИЯ АДМИНКИ!
 async def handle_unexpected_message_in_state(message: Message, state: FSMContext):
+    """
+    Обрабатывает сообщения, не подходящие для текущего состояния админки.
+    """
     current_state = await state.get_state()
-    logger.warning(f"User {message.from_user.id} sent unexpected message '{message.text}' while in state '{current_state}'")
+    logger.warning(f"User {message.from_user.id} sent unexpected message '{message.text}' while in admin state '{current_state}'. Clearing state.")
+
+    # Сбрасываем состояние пользователя
     await state.clear()
+    logger.info(f"State after clear for user {message.from_user.id}: {await state.get_state()}")
+
+    # Отправляем сообщение об ошибке/отмене
     await message.answer(
         "Операция была прервана из-за непредвиденного ввода.\n"
-        "Пожалуйста, начните заново, используя команды (/admin, /start) или кнопки меню."
+        "Состояние сброшено. Возврат в главное меню."
     )
+    # --- Явно отправляем главное меню ---
+    # (Предполагается, что функция start_command отправляет клавиатуру)
+    # Создаем клавиатуру заново, т.к. у нас нет доступа к готовой из start_command тут легко
+    buttons = []; row = []
+    for section_name in sections.values():
+        row.append(KeyboardButton(text=section_name));
+        if len(row) == 2: buttons.append(row); row = []
+    if row: buttons.append(row)
+    keyboard = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+    await message.answer("Пожалуйста, начните заново, используя команды (/admin, /start) или кнопки меню.", reply_markup=keyboard)
+    # --- Конец отправки главного меню ---
 
-# <<< ВСТАВИТЬ ФРАГМЕНТ 2 ЗДЕСЬ >>>
-# Хендлер для любых колбэков в любом состоянии, если они не были обработаны ранее
-@dp.callback_query(StateFilter('*')) # StateFilter('*') ловит любое состояние
+
+# Хендлер для любых колбэков в любом состоянии FSM
+@dp.callback_query(StateFilter(AdminStates)) # ЛОВИМ ТОЛЬКО СОСТОЯНИЯ АДМИНКИ!
 async def handle_unexpected_callback_in_state(callback: CallbackQuery, state: FSMContext):
+    """
+    Обрабатывает нажатия inline-кнопок в состояниях админки,
+    если для колбэка нет подходящего хендлера.
+    """
     current_state = await state.get_state()
-    logger.warning(f"User {callback.from_user.id} sent unexpected callback '{callback.data}' while in state '{current_state}'")
-    await state.clear()
+    logger.warning(f"User {callback.from_user.id} sent unexpected callback '{callback.data}' while in admin state '{current_state}'. Clearing state.")
+
+    # Сначала отвечаем на колбэк
     await callback.answer(
-        "Операция была прервана из-за нажатия неактуальной кнопки. Попробуйте снова.",
+        "Операция была прервана из-за нажатия неактуальной кнопки.",
         show_alert=True
     )
+
+    # Сбрасываем состояние пользователя
+    await state.clear()
+    logger.info(f"State after clear for user {callback.from_user.id}: {await state.get_state()}")
+
+    # Отправляем новое сообщение и главное меню
+    await callback.message.answer(
+         "Текущая операция отменена. Состояние сброшено.\n"
+         "Возврат в главное меню."
+    )
+    # --- Явно отправляем главное меню ---
+    buttons = []; row = []
+    for section_name in sections.values():
+        row.append(KeyboardButton(text=section_name));
+        if len(row) == 2: buttons.append(row); row = []
+    if row: buttons.append(row)
+    keyboard = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+    # Отправляем от имени бота, а не как ответ на колбэк-сообщение
+    await bot.send_message(callback.from_user.id, "Пожалуйста, начните заново, используя команды (/admin, /start) или кнопки меню", reply_markup=keyboard)
+     # --- Конец отправки главного меню ---
+
+    # Попытаемся убрать кнопки из старого сообщения, если возможно
     try:
-        await callback.message.edit_text(
-            f"{callback.message.text}\n\n(Операция отменена)",
-            reply_markup=None
-            )
+        await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
-        await callback.message.answer(
-            "Текущая операция отменена. Пожалуйста, начните заново, используя команды (/admin, /start) или кнопки меню."
-        )
+        pass # Игнорируем ошибки редактирования
 
 
 # --- Обработчик команды /start ---
@@ -644,6 +687,7 @@ async def start_command(message: types.Message):
     if row: buttons.append(row)
     keyboard = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
     await message.answer("🎨 Добро пожаловать в ONLINE GALLERY OF AIRO!", reply_markup=keyboard)
+
 
 # --- Регистрация обработчиков для кнопок разделов ---
 def register_section_handlers():
