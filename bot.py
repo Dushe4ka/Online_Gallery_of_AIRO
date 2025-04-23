@@ -596,6 +596,40 @@ async def admin_remove_moderator_confirmed(callback: CallbackQuery, state: FSMCo
          if panel_kb: await callback.message.answer(final_text, reply_markup=panel_kb)
          else: await callback.message.answer(final_text)
 
+# --- Перехватчики непредвиденного ввода в состояниях ---
+# <<< ВСТАВИТЬ ФРАГМЕНТ 1 ЗДЕСЬ >>>
+# Хендлер для любых сообщений в любом состоянии, если они не были обработаны ранее
+@dp.message(StateFilter('*')) # StateFilter('*') ловит любое состояние
+async def handle_unexpected_message_in_state(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    logger.warning(f"User {message.from_user.id} sent unexpected message '{message.text}' while in state '{current_state}'")
+    await state.clear()
+    await message.answer(
+        "Операция была прервана из-за непредвиденного ввода.\n"
+        "Пожалуйста, начните заново, используя команды (/admin, /start) или кнопки меню."
+    )
+
+# <<< ВСТАВИТЬ ФРАГМЕНТ 2 ЗДЕСЬ >>>
+# Хендлер для любых колбэков в любом состоянии, если они не были обработаны ранее
+@dp.callback_query(StateFilter('*')) # StateFilter('*') ловит любое состояние
+async def handle_unexpected_callback_in_state(callback: CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    logger.warning(f"User {callback.from_user.id} sent unexpected callback '{callback.data}' while in state '{current_state}'")
+    await state.clear()
+    await callback.answer(
+        "Операция была прервана из-за нажатия неактуальной кнопки. Попробуйте снова.",
+        show_alert=True
+    )
+    try:
+        await callback.message.edit_text(
+            f"{callback.message.text}\n\n(Операция отменена)",
+            reply_markup=None
+            )
+    except Exception:
+        await callback.message.answer(
+            "Текущая операция отменена. Пожалуйста, начните заново, используя команды (/admin, /start) или кнопки меню."
+        )
+
 
 # --- Обработчик команды /start ---
 @dp.message(Command("start"), StateFilter(None))
