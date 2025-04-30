@@ -51,7 +51,7 @@ sections = {
 }
 if not all(key in CONTENT_SECTIONS for key in sections.keys()):
     logger.critical("Mismatch between 'sections' dict and CONTENT_SECTIONS in database.py!")
-SECTIONS_WITH_DESCRIPTION_TOGGLE = ["catalog", "icons", "events", "about_style"]
+SECTIONS_WITH_DESCRIPTION_TOGGLE = ["catalog", "icons", "events", "about_style", "guests"]
 
 # --- Состояния FSM ---
 class AdminStates(StatesGroup):
