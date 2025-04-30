@@ -46,12 +46,12 @@ dp = Dispatcher()
 # --- Разделы ---
 sections = {
     "about_artist": "🎨 О художнике", "about_style": "🤍 Life", "catalog": "🖼 Каталог картин",
-    "icons": "☦️ Иконы", "events": "📅 Мероприятия", "guests": "👥 Наши гости",
+    "icons": "☦️ Иконы", "events": "📅 Мероприятия", "guests": "📣 Афиша",
     "cooperation": "🤝 Сотрудничество", "contacts": "📞 Контакты"
 }
 if not all(key in CONTENT_SECTIONS for key in sections.keys()):
     logger.critical("Mismatch between 'sections' dict and CONTENT_SECTIONS in database.py!")
-SECTIONS_WITH_DESCRIPTION_TOGGLE = ["catalog", "icons"]
+SECTIONS_WITH_DESCRIPTION_TOGGLE = ["catalog", "icons", "events", "about_style"]
 
 # --- Состояния FSM ---
 class AdminStates(StatesGroup):
@@ -224,112 +224,163 @@ async def handle_section_button(message: types.Message):
 async def show_description_handler(callback: CallbackQuery):
     """Обрабатывает нажатие кнопки 'Описание'."""
     logger.info(f"Received callback: {callback.data}")
-    if not callback.data: logger.error(f"Empty callback data (show_desc)"); return await callback.answer("Ошибка!", show_alert=True)
+    if not callback.data:
+        logger.error("Empty callback data (show_desc)")
+        await callback.answer("Ошибка!", show_alert=True)
+        return
 
     try:
         parts = callback.data.split("_")
         logger.debug(f"Callback data parts (show_desc): {parts}")
-        if len(parts) != 4 or parts[0] != "show" or parts[1] != "desc": raise ValueError("Invalid format")
-        prefix1, prefix2, section, post_id_str = parts
-        if not section or section not in sections: raise ValueError(f"Invalid section: '{section}'")
-        post_id = int(post_id_str); assert post_id > 0
+
+        # Проверяем минимальное количество частей и префиксы
+        if len(parts) < 4 or parts[0] != "show" or parts[1] != "desc":
+            raise ValueError("Invalid format")
+
+        # Объединяем оставшиеся части, кроме последней (post_id), чтобы получить раздел
+        section = "_".join(parts[2:-1])
+        post_id_str = parts[-1]
+
+        if not section or section not in sections:
+            raise ValueError(f"Invalid section: '{section}'")
+
+        post_id = int(post_id_str)
+        if post_id <= 0:
+            raise ValueError("Post ID must be positive")
+
+        logger.info(f"User {callback.from_user.id} requested description for post_id={post_id} in section='{section}'")
+        post_details = await get_post_details(section, post_id)
+
+        if not post_details:
+            logger.warning(f"Post not found for show_desc: section='{section}', post_id={post_id}")
+            await callback.answer("❗️ Пост не найден.", show_alert=True)
+            try:
+                await callback.message.edit_text(callback.message.text or "Пост удален.", reply_markup=None)
+            except:
+                pass
+            return
+
+        title = post_details["title"]
+        description = post_details["description"] or "Нет описания."
+        media = post_details["media"]
+
+        full_post_text = f"📌 {title}\n\n{description}"
+        new_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➖ Скрыть описание", callback_data=f"hide_desc_{section}_{post_id}")]
+        ])
+
+        try:
+            if not media:
+                await callback.message.edit_text(text=full_post_text, reply_markup=new_keyboard)
+            elif len(media) == 1:
+                await callback.message.edit_caption(caption=full_post_text, reply_markup=new_keyboard)
+            else:
+                await callback.message.edit_text(text=full_post_text, reply_markup=new_keyboard)
+            await callback.answer()
+        except exceptions.TelegramBadRequest as e:
+            logger.error(f"Error editing message (show desc) mid={callback.message.message_id}: {e}")
+            if "message is not modified" in str(e):
+                await callback.answer()
+            elif "message to edit not found" in str(e):
+                await callback.answer("Сообщение не найдено.", show_alert=True)
+            elif "message can't be edited" in str(e):
+                await callback.answer("Не изменить.", show_alert=True)
+            else:
+                await callback.answer("❗️ Не обновить.", show_alert=True)
+        except Exception as e:
+            logger.error(f"Unexpected error editing message (show desc) mid={callback.message.message_id}: {e}\n{traceback.format_exc()}")
+            await callback.answer("❗️ Ошибка.", show_alert=True)
+
     except (ValueError, IndexError, TypeError, AssertionError) as e:
         logger.error(f"Invalid callback data format for show_desc: '{callback.data}'. Error: {e}")
         await callback.answer("Ошибка формата данных!", show_alert=True)
-        try: await callback.message.edit_reply_markup(reply_markup=None)
-        except: pass
-        return
-
-    logger.info(f"User {callback.from_user.id} requested description for post_id={post_id} in section='{section}'")
-    post_details = await get_post_details(section, post_id)
-    if not post_details:
-        logger.warning(f"Post not found for show_desc: section='{section}', post_id={post_id}")
-        await callback.answer("❗️ Пост не найден.", show_alert=True)
-        try: await callback.message.edit_text(callback.message.text or "Пост удален.", reply_markup=None)
-        except: pass
-        return
-
-    title = post_details["title"]
-    description = post_details["description"] or "Нет описания."
-    media = post_details["media"]
-
-    # Формируем полный текст (без HTML) и кнопку "Скрыть"
-    full_post_text = f"📌 {title}\n\n{description}"
-    new_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➖ Скрыть описание", callback_data=f"hide_desc_{section}_{post_id}")]
-    ])
-
-    try:
-        # Редактируем сообщение, где была кнопка "Описание"
-        if not media: await callback.message.edit_text(text=full_post_text, reply_markup=new_keyboard)
-        elif len(media) == 1: await callback.message.edit_caption(caption=full_post_text, reply_markup=new_keyboard)
-        else: await callback.message.edit_text(text=full_post_text, reply_markup=new_keyboard) # Редактируем сообщение с кнопкой
-        await callback.answer()
-    except exceptions.TelegramBadRequest as e:
-        logger.error(f"Error editing message (show desc) mid={callback.message.message_id}: {e}")
-        if "message is not modified" in str(e): await callback.answer()
-        elif "message to edit not found" in str(e): await callback.answer("Сообщение не найдено.", show_alert=True)
-        elif "message can't be edited" in str(e): await callback.answer("Не изменить.", show_alert=True)
-        else: await callback.answer("❗️ Не обновить.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except:
+            pass
     except Exception as e:
-        logger.error(f"Unexpected error editing message (show desc) mid={callback.message.message_id}: {e}\n{traceback.format_exc()}")
-        await callback.answer("❗️ Ошибка.", show_alert=True)
+        logger.error(f"Unexpected error in show_description_handler: {e}\n{traceback.format_exc()}")
+        await callback.answer("❗️ Внутренняя ошибка.", show_alert=True)
 
 @dp.callback_query(F.data.startswith("hide_desc_"))
 async def hide_description_handler(callback: CallbackQuery):
     """Обрабатывает нажатие кнопки 'Скрыть описание'."""
     logger.info(f"Received callback: {callback.data}")
-    if not callback.data: logger.error(f"Empty callback data (hide_desc)"); return await callback.answer("Ошибка!", show_alert=True)
+    if not callback.data:
+        logger.error("Empty callback data (hide_desc)")
+        await callback.answer("Ошибка!", show_alert=True)
+        return
 
     try:
+        # Разбираем callback_data, учитывая подчеркивания в названиях разделов
         parts = callback.data.split("_")
-        logger.debug(f"Callback data parts (hide_desc): {parts}")
-        if len(parts) != 4 or parts[0] != "hide" or parts[1] != "desc": raise ValueError("Invalid format")
-        prefix1, prefix2, section, post_id_str = parts
-        if not section or section not in sections: raise ValueError(f"Invalid section: '{section}'")
-        post_id = int(post_id_str); assert post_id > 0
+        if len(parts) < 4 or parts[0] != "hide" or parts[1] != "desc":
+            raise ValueError("Invalid format")
+
+        # Объединяем части, начиная с индекса 2, кроме последней (post_id)
+        section = "_".join(parts[2:-1])
+        post_id_str = parts[-1]
+
+        if not section or section not in sections:
+            raise ValueError(f"Invalid section: '{section}'")
+
+        post_id = int(post_id_str)
+        if post_id <= 0:
+            raise ValueError("Post ID must be positive")
+
+        logger.info(f"User {callback.from_user.id} requested to hide description for post_id={post_id} in section='{section}'")
+        post_details = await get_post_details(section, post_id)
+
+        if not post_details:
+            logger.warning(f"Post not found for hide_desc: section='{section}', post_id={post_id}")
+            await callback.answer("❗️ Пост не найден.", show_alert=True)
+            try:
+                await callback.message.edit_text(callback.message.text or "Пост удален.", reply_markup=None)
+            except:
+                pass
+            return
+
+        title = post_details["title"]
+        media = post_details["media"]
+
+        # Формируем кнопку "Описание"
+        new_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="ℹ️ ОПИСАНИЕ", callback_data=f"show_desc_{section}_{post_id}")]
+        ])
+        short_text = f"📌 {title}"
+
+        try:
+            if not media:
+                await callback.message.edit_text(text=short_text, reply_markup=new_keyboard)
+            elif len(media) == 1:
+                await callback.message.edit_caption(caption=short_text, reply_markup=new_keyboard)
+            else:
+                await callback.message.edit_text(text="Меню поста:", reply_markup=new_keyboard)
+            await callback.answer()
+        except exceptions.TelegramBadRequest as e:
+            logger.error(f"Error editing message (hide_desc) mid={callback.message.message_id}: {e}")
+            if 'message is not modified' in str(e):
+                await callback.answer()
+            elif "message to edit not found" in str(e):
+                await callback.answer("Сообщение не найдено.", show_alert=True)
+            elif "message can't be edited" in str(e):
+                await callback.answer("Не изменить.", show_alert=True)
+            else:
+                await callback.answer("❗️ Не обновить.", show_alert=True)
+        except Exception as e:
+            logger.error(f"Unexpected error editing message (hide_desc) mid={callback.message.message_id}: {e}\n{traceback.format_exc()}")
+            await callback.answer("❗️ Ошибка.", show_alert=True)
+
     except (ValueError, IndexError, TypeError, AssertionError) as e:
         logger.error(f"Invalid callback data format for hide_desc: '{callback.data}'. Error: {e}")
         await callback.answer("Ошибка формата данных!", show_alert=True)
-        try: await callback.message.edit_reply_markup(reply_markup=None)
-        except: pass
-        return
-
-    logger.info(f"User {callback.from_user.id} requested to hide description for post_id={post_id} in section='{section}'")
-    post_details = await get_post_details(section, post_id) # Нужны title и media
-    if not post_details:
-        logger.warning(f"Post not found for hide_desc: section='{section}', post_id={post_id}")
-        await callback.answer("❗️ Пост не найден.", show_alert=True)
-        try: await callback.message.edit_text(callback.message.text or "Пост удален.", reply_markup=None)
-        except: pass
-        return
-
-    title = post_details["title"]
-    media = post_details["media"]
-
-    # Формируем кнопку "Описание"
-    new_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="ℹ️ ОПИСАНИЕ", callback_data=f"show_desc_{section}_{post_id}")]
-    ])
-    # Формируем текст для начального состояния (без HTML)
-    short_text = f"📌 {title}"
-    button_message_text = "Меню поста:"
-
-    try:
-        # Редактируем сообщение, где была кнопка "Скрыть описание"
-        if not media: await callback.message.edit_text(text=short_text, reply_markup=new_keyboard)
-        elif len(media) == 1: await callback.message.edit_caption(caption=short_text, reply_markup=new_keyboard)
-        else: await callback.message.edit_text(text=button_message_text, reply_markup=new_keyboard) # Возвращаем к "Меню поста:"
-        await callback.answer()
-    except exceptions.TelegramBadRequest as e:
-        logger.error(f"Error editing message (hide_desc) mid={callback.message.message_id}: {e}")
-        if 'message is not modified' in str(e): await callback.answer()
-        elif "message to edit not found" in str(e): await callback.answer("Сообщение не найдено.", show_alert=True)
-        elif "message can't be edited" in str(e): await callback.answer("Не изменить.", show_alert=True)
-        else: await callback.answer("❗️ Не обновить.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except:
+            pass
     except Exception as e:
-        logger.error(f"Unexpected error editing message (hide_desc) mid={callback.message.message_id}: {e}\n{traceback.format_exc()}")
-        await callback.answer("❗️ Ошибка.", show_alert=True)
+        logger.error(f"Unexpected error in hide_description_handler: {e}\n{traceback.format_exc()}")
+        await callback.answer("❗️ Внутренняя ошибка.", show_alert=True)
 
 
 # --- Админ-панель ---
