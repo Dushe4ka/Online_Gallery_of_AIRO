@@ -5,7 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from database import (
     add_content, delete_content, delete_all_content,
-    add_moderator, remove_moderator, is_moderator, get_content
+    add_moderator, remove_moderator, is_moderator, get_content, get_posts
 )
 from config import ADMINS
 from bot import dp, sections, bot
@@ -158,13 +158,47 @@ async def process_photos(message: types.Message, state: FSMContext):
         await message.answer("✅ Контент успешно добавлен без фотографий.")
     elif message.photo:
         # Если пользователь отправил фотографии, сохраняем их
-        photos = list(set([("photo", photo.file_id) for photo in message.photo]))  # Убираем дубликаты
-        await add_content(section, "Заголовок", description, photos)
-        await message.answer(f"✅ Контент успешно добавлен с {len(photos)} фотографиями.")
+        photos = [{"type": "photo", "file_id": p.file_id} for p in message.photo]
+        seen = set()
+        unique = []
+        for p in photos:
+            k = (p["type"], p["file_id"])
+            if k not in seen:
+                seen.add(k)
+                unique.append(p)
+        await add_content(section, "Заголовок", description, unique)
+        await message.answer(f"✅ Контент успешно добавлен с {len(unique)} фотографиями.")
     else:
         await message.answer("⚠ Пожалуйста, отправьте фотографии или '-'.")
 
     await state.clear()
+
+
+POSTS_PER_PAGE = 8  # Лимит Telegram: ~100 кнопок, ~4KB reply_markup
+
+
+def _build_delete_posts_keyboard(posts: list, section: str, page: int) -> InlineKeyboardMarkup:
+    """Строит клавиатуру с постами для удаления + пагинация."""
+    total = len(posts)
+    start = page * POSTS_PER_PAGE
+    end = min(start + POSTS_PER_PAGE, total)
+    page_posts = posts[start:end]
+
+    rows = []
+    for post_id, title in page_posts:
+        btn_text = (title[:27] + "…") if title and len(title) > 30 else (title or f"Пост {post_id}")
+        rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"delete_post_{post_id}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"delpg:{section}:{page - 1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton(text="Далее ▶", callback_data=f"delpg:{section}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="del_content")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @dp.callback_query(F.data.startswith("del_content_"), DeleteContentState.waiting_for_section)
@@ -173,20 +207,52 @@ async def delete_content_section_handler(callback: CallbackQuery, state: FSMCont
     section = callback.data.split("_", 2)[-1]
     await state.update_data(section=section)
 
-    # Получаем контент из раздела
-    content = await get_content(section)
-    if not content:
+    posts = await get_posts(section)
+    if not posts:
         await callback.message.answer("⚠ В этом разделе пока нет контента.")
         await state.clear()
         return
 
-    # Создаем клавиатуру с постами
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{row[1]}", callback_data=f"delete_post_{row[0]}")]
-        for row in content
-    ])
-    await callback.message.answer("🗑 Выберите пост для удаления:", reply_markup=keyboard)
+    keyboard = _build_delete_posts_keyboard(posts, section, 0)
+    total = len(posts)
+    page_info = f" (стр. 1/{(total + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE})" if total > POSTS_PER_PAGE else ""
+    await callback.message.answer(
+        f"🗑 Выберите пост для удаления из «{sections[section]}»{page_info}:",
+        reply_markup=keyboard
+    )
     await state.set_state(DeleteContentState.waiting_for_content_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("delpg:"), DeleteContentState.waiting_for_content_id)
+async def delete_content_pagination_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработчик пагинации при выборе поста для удаления"""
+    parts = callback.data.split(":")
+    if len(parts) < 2 or parts[1] == "cancel":
+        await callback.message.edit_text("❌ Операция отменена.", reply_markup=None)
+        await state.clear()
+        await callback.answer()
+        return
+
+    section = parts[1]
+    page = int(parts[2])
+    await state.update_data(section=section)
+
+    posts = await get_posts(section)
+    if not posts:
+        await callback.message.answer("⚠ В этом разделе пока нет контента.")
+        await state.clear()
+        await callback.answer()
+        return
+
+    keyboard = _build_delete_posts_keyboard(posts, section, page)
+    total = len(posts)
+    total_pages = (total + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE
+    page_info = f" (стр. {page + 1}/{total_pages})" if total_pages > 1 else ""
+    await callback.message.edit_text(
+        f"🗑 Выберите пост для удаления из «{sections[section]}»{page_info}:",
+        reply_markup=keyboard
+    )
     await callback.answer()
 
 

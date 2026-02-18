@@ -9,7 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from config import BOT_TOKEN, ADMINS
 from database import (
-    init_db, add_user, get_content, get_users,
+    init_db, add_user, get_content, get_users, get_posts,
     add_content, delete_content, delete_all_content,
     add_moderator, remove_moderator, is_moderator, get_moderators
 )
@@ -60,6 +60,19 @@ class RemoveModeratorState(StatesGroup):
     confirmation = State()
 
 from aiogram.types import InputMediaVideo
+from aiogram.exceptions import TelegramRetryAfter
+
+DELAY_BETWEEN_POSTS = 1.0  # секунд — защита от Flood control
+
+
+async def _send_with_retry(send_fn):
+    """Выполняет отправку с повторной попыткой при TelegramRetryAfter. send_fn — callable, возвращающий coroutine."""
+    while True:
+        try:
+            return await send_fn()
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+
 
 async def send_content(message: types.Message, section: str):
     """Отправляет контент пользователю с группировкой медиа"""
@@ -84,9 +97,12 @@ async def send_content(message: types.Message, section: str):
         elif row[3] == "video":
             posts[post_id]["videos"].append(row[4])
 
+    CAPTION_MAX = 1024  # Лимит Telegram для caption
+
     # Отправляем посты
     for post in posts.values():
-        text = f"📌 <b>{post['title']}</b>\n\n{post['description']}"
+        full_text = f"📌 <b>{post['title']}</b>\n\n{post['description']}"
+        caption = full_text if len(full_text) <= CAPTION_MAX else full_text[:CAPTION_MAX - 3] + "…"
 
         # Создаем медиагруппу
         media_group = []
@@ -96,7 +112,7 @@ async def send_content(message: types.Message, section: str):
             media_group.append(
                 InputMediaPhoto(
                     media=post["photos"][0],
-                    caption=text,
+                    caption=caption,
                     parse_mode="HTML"
                 )
             )
@@ -114,10 +130,13 @@ async def send_content(message: types.Message, section: str):
 
         # Отправляем медиагруппу
         if media_group:
-            await message.answer_media_group(media_group)
+            await _send_with_retry(lambda: message.answer_media_group(media_group))
+            if len(full_text) > CAPTION_MAX:
+                await _send_with_retry(lambda: message.answer(full_text, parse_mode="HTML"))
         else:
-            # Если нет медиафайлов, отправляем только текст
-            await message.answer(text, parse_mode="HTML")
+            await _send_with_retry(lambda: message.answer(full_text, parse_mode="HTML"))
+
+        await asyncio.sleep(DELAY_BETWEEN_POSTS)
 
 
 ### --- ОБРАБОТЧИКИ КНОПОК --- ###
@@ -171,6 +190,17 @@ async def admin_command(message: types.Message):
     else:
         await message.answer(response)
 
+@dp.callback_query(F.data == "back_to_admin")
+async def back_to_admin(callback: CallbackQuery):
+    """Обработчик кнопки 'Назад'"""
+    user_id = callback.from_user.id
+    response = await show_admin_panel(user_id)
+
+    if isinstance(response, tuple):
+        text, keyboard = response
+        await callback.message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await callback.message.answer(response)
 
 ### --- ОБРАБОТЧИКИ CALLBACK-КНОПОК --- ###
 async def get_sections_keyboard(action: str):
@@ -178,6 +208,8 @@ async def get_sections_keyboard(action: str):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=name, callback_data=f"{action}_{section}")]
         for section, name in sections.items()
+    ] + [
+        [InlineKeyboardButton(text="Назад", callback_data="back_to_admin")]
     ])
     return keyboard
 
@@ -317,39 +349,85 @@ async def delete_content_handler(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+POSTS_PER_PAGE = 8  # Лимит Telegram: ~100 кнопок, ~4KB reply_markup
+
+
+def _build_delete_posts_keyboard(posts: list, section: str, page: int) -> InlineKeyboardMarkup:
+    """Строит клавиатуру с постами для удаления + пагинация."""
+    total = len(posts)
+    start = page * POSTS_PER_PAGE
+    end = min(start + POSTS_PER_PAGE, total)
+    page_posts = posts[start:end]
+
+    rows = []
+    for post_id, title in page_posts:
+        btn_text = (title[:27] + "…") if title and len(title) > 30 else (title or f"Пост {post_id}")
+        rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"delete_post_{post_id}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"delpg:{section}:{page - 1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton(text="Далее ▶", callback_data=f"delpg:{section}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="del_content")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.callback_query(F.data.startswith("del_content_"), DeleteContentState.waiting_for_section)
 async def delete_content_section_handler(callback: CallbackQuery, state: FSMContext):
     """Обработчик выбора раздела для удаления контента"""
     section = callback.data.split("_", 2)[-1]
     await state.update_data(section=section)
 
-    # Получаем контент из раздела
-    content = await get_content(section)
-    if not content:
+    posts = await get_posts(section)
+    if not posts:
         await callback.message.answer("⚠ В этом разделе пока нет контента.")
         await state.clear()
         return
 
-    # Группируем по постам
-    posts = {}
-    for row in content:
-        post_id = row[0]
-        if post_id not in posts:
-            posts[post_id] = {
-                "title": row[1],
-                "description": row[2],
-                "media": []
-            }
-        if row[3] == "photo":
-            posts[post_id]["media"].append(row[4])
-
-    # Создаем клавиатуру с постами
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{post['title']}", callback_data=f"delete_post_{post_id}")]
-        for post_id, post in posts.items()
-    ])
-    await callback.message.answer("🗑 Выберите пост для удаления:", reply_markup=keyboard)
+    keyboard = _build_delete_posts_keyboard(posts, section, 0)
+    total = len(posts)
+    page_info = f" (стр. 1/{(total + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE})" if total > POSTS_PER_PAGE else ""
+    await callback.message.answer(
+        f"🗑 Выберите пост для удаления из «{sections[section]}»{page_info}:",
+        reply_markup=keyboard
+    )
     await state.set_state(DeleteContentState.waiting_for_content_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("delpg:"), DeleteContentState.waiting_for_content_id)
+async def delete_content_pagination_handler(callback: CallbackQuery, state: FSMContext):
+    """Обработчик пагинации при выборе поста для удаления"""
+    parts = callback.data.split(":")
+    if len(parts) < 2 or parts[1] == "cancel":
+        await callback.message.edit_text("❌ Операция отменена.", reply_markup=None)
+        await state.clear()
+        await callback.answer()
+        return
+
+    section = parts[1]
+    page = int(parts[2])
+    await state.update_data(section=section)
+
+    posts = await get_posts(section)
+    if not posts:
+        await callback.message.answer("⚠ В этом разделе пока нет контента.")
+        await state.clear()
+        await callback.answer()
+        return
+
+    keyboard = _build_delete_posts_keyboard(posts, section, page)
+    total = len(posts)
+    total_pages = (total + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE
+    page_info = f" (стр. {page + 1}/{total_pages})" if total_pages > 1 else ""
+    await callback.message.edit_text(
+        f"🗑 Выберите пост для удаления из «{sections[section]}»{page_info}:",
+        reply_markup=keyboard
+    )
     await callback.answer()
 
 

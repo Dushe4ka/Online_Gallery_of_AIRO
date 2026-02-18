@@ -122,6 +122,16 @@ async def get_content(section):
         return await cursor.fetchall()
 
 
+async def get_posts(section):
+    """Получает уникальные посты (id, title) для раздела. Без дублей от медиафайлов."""
+    async with aiosqlite.connect(DATABASE) as db:
+        cursor = await db.execute(f"""
+            SELECT id, title FROM {section}
+            ORDER BY published_at DESC
+        """)
+        return await cursor.fetchall()
+
+
 async def get_moderators():
     """Получает всех модераторов"""
     async with aiosqlite.connect(DATABASE) as db:
