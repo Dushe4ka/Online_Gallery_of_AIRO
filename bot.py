@@ -499,8 +499,29 @@ async def admin_add_content_finish_media(callback: CallbackQuery, state: FSMCont
     except: await callback.message.delete(); await callback.message.answer(final_message)
     await callback.answer("Готово!"); await state.clear()
 
-# -- Удаление контента --
-# (Обработчики del_content и clear_section остаются без изменений в логике, но используют обычный текст)
+# -- Удаление контента (пагинация: лимит Telegram ~100 кнопок / ~4KB) --
+POSTS_PER_PAGE = 8
+
+def _build_delete_posts_keyboard(posts_list: list, section: str, page: int) -> InlineKeyboardMarkup:
+    total = len(posts_list)
+    start = page * POSTS_PER_PAGE
+    end = min(start + POSTS_PER_PAGE, total)
+    page_posts = posts_list[start:end]
+    buttons = []
+    for post_id, title in page_posts:
+        btn_text = f"{post_id}: {(title[:27] + '…') if len(title) > 30 else title}"
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"admin:del_post:{post_id}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"admin:del_page:{section}:{page - 1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton(text="Далее ▶", callback_data=f"admin:del_page:{section}:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:back_to_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @dp.callback_query(F.data == "admin:del_content", StateFilter(None))
 async def admin_delete_content_start(callback: CallbackQuery, state: FSMContext):
     is_adm, is_mod = await is_admin_or_moderator(callback.from_user.id)
@@ -514,17 +535,58 @@ async def admin_delete_content_start(callback: CallbackQuery, state: FSMContext)
 async def admin_delete_content_section_selected(callback: CallbackQuery, state: FSMContext):
     section = callback.data.split(":")[-1]
     if section not in sections: return await callback.answer("⚠️ Неверный раздел.", show_alert=True)
-    await state.update_data(current_section=section); content_rows = await get_content(section)
-    if not content_rows: await callback.message.edit_text(f"ℹ️ В '{sections[section]}' нет контента."); await callback.answer(); await state.clear(); return
-    posts = {}; buttons = []
-    for row in content_rows: post_id, title, _, _, _ = row; posts.setdefault(post_id, title or f"Пост #{post_id}")
-    # Используем сортировку из get_content (ASC)
-    for post_id in posts.keys(): title = posts[post_id]; button_text = f"{post_id}: {title[:40]}{'...' if len(title) > 40 else ''}"; buttons.append([InlineKeyboardButton(text=button_text, callback_data=f"admin:del_post:{post_id}")])
-    if not buttons: await callback.message.edit_text("⚠️ Не удалось список."); await state.clear(); return
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:back_to_panel")])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text(f"🗑 Выберите пост для удаления из '{sections[section]}':", reply_markup=keyboard)
-    await state.set_state(AdminStates.delete_content_choose_post); await callback.answer()
+    await state.update_data(current_section=section)
+    content_rows = await get_content(section)
+    if not content_rows:
+        await callback.message.edit_text(f"ℹ️ В '{sections[section]}' нет контента.")
+        await callback.answer(); await state.clear(); return
+    seen = set()
+    posts_list = []
+    for row in content_rows:
+        post_id, title = row[0], (row[1] or f"Пост #{row[0]}")
+        if post_id not in seen:
+            seen.add(post_id)
+            posts_list.append((post_id, title))
+    if not posts_list:
+        await callback.message.edit_text("⚠️ Не удалось список."); await state.clear(); return
+    keyboard = _build_delete_posts_keyboard(posts_list, section, 0)
+    total = len(posts_list)
+    page_info = f" (стр. 1/{(total + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE})" if total > POSTS_PER_PAGE else ""
+    try:
+        await callback.message.edit_text(f"🗑 Выберите пост для удаления из «{sections[section]}»{page_info}:", reply_markup=keyboard)
+    except Exception:
+        await callback.message.delete()
+        await callback.message.answer(f"🗑 Выберите пост для удаления из «{sections[section]}»{page_info}:", reply_markup=keyboard)
+    await state.set_state(AdminStates.delete_content_choose_post)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:del_page:"), AdminStates.delete_content_choose_post)
+async def admin_delete_content_pagination(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    if len(parts) < 4: return await callback.answer("⚠️ Ошибка.", show_alert=True)
+    section = parts[2]
+    try: page = int(parts[3])
+    except ValueError: return await callback.answer("⚠️ Ошибка.", show_alert=True)
+    if section not in sections: return await callback.answer("⚠️ Неверный раздел.", show_alert=True)
+    await state.update_data(current_section=section)
+    content_rows = await get_content(section)
+    if not content_rows:
+        await callback.message.edit_text(f"ℹ️ В '{sections[section]}' нет контента.")
+        await state.clear(); return await callback.answer()
+    seen = set()
+    posts_list = []
+    for row in content_rows:
+        post_id, title = row[0], (row[1] or f"Пост #{row[0]}")
+        if post_id not in seen:
+            seen.add(post_id)
+            posts_list.append((post_id, title))
+    keyboard = _build_delete_posts_keyboard(posts_list, section, page)
+    total = len(posts_list)
+    total_pages = (total + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE
+    page_info = f" (стр. {page + 1}/{total_pages})" if total_pages > 1 else ""
+    await callback.message.edit_text(f"🗑 Выберите пост для удаления из «{sections[section]}»{page_info}:", reply_markup=keyboard)
+    await callback.answer()
 @dp.callback_query(F.data.startswith("admin:del_post:"), AdminStates.delete_content_choose_post)
 async def admin_delete_content_post_selected(callback: CallbackQuery, state: FSMContext):
     try: post_id = int(callback.data.split(":")[-1])
